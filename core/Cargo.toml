@@ -1,0 +1,13 @@
+[package]
+name = "wdc-core"
+description = "Types, ports and controllers for wsl-disk-cleaner. No I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true

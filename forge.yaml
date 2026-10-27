@@ -1,0 +1,37 @@
+name: wsl-disk-cleaner
+
+artifactStorePath: .forge/artifact-store.yaml
+
+build:
+  - name: format-code
+    src: .
+    engine: forge://generic-builder
+    spec:
+      command: cargo
+      args: ["fmt", "--all"]
+
+  - name: wdc
+    src: .
+    engine: forge://generic-builder
+    spec:
+      command: cargo
+      args: ["build", "--release", "--bin", "wdc"]
+
+test:
+  - name: lint
+    runner: forge://generic-test-runner
+    spec:
+      command: cargo
+      args: ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+  - name: format-check
+    runner: forge://generic-test-runner
+    spec:
+      command: cargo
+      args: ["fmt", "--all", "--", "--check"]
+
+  - name: unit
+    runner: forge://generic-test-runner
+    spec:
+      command: cargo
+      args: ["test", "--workspace"]

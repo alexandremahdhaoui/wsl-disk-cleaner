@@ -1,0 +1,20 @@
+[package]
+name = "wdc-app"
+description = "Adapters, drivers and the wdc binary for wsl-disk-cleaner."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wdc-core = { path = "../core" }
+anyhow.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "wdc"
+path = "src/bin/wdc.rs"
+test = false

@@ -7,6 +7,7 @@ use clap::Parser;
 use wdc_app::adapter::buildah_adapter::BuildahAdapter;
 use wdc_app::adapter::cargo_target_adapter::CargoTargetAdapter;
 use wdc_app::adapter::container_adapter::{ContainerAdapter, CONTAINER_ENGINES};
+use wdc_app::adapter::keep_config_adapter::{config_path, load_keep_images};
 use wdc_app::adapter::powershell_adapter::PowershellAdapter;
 use wdc_app::adapter::process_adapter::ProcessAdapter;
 use wdc_app::adapter::tool_cache_adapter::{ToolCacheAdapter, TOOL_CACHES};
@@ -55,8 +56,13 @@ fn build_driver() -> Result<CliDriver> {
             .iter()
             .map(|cache| Arc::new(ToolCacheAdapter::new(cache)) as Arc<dyn CleanupSource>),
     );
+    let keep_images = load_keep_images(&config_path(&home))?;
     cleanup_sources.extend(CONTAINER_ENGINES.iter().map(|engine| {
-        Arc::new(ContainerAdapter::new(engine, home.clone())) as Arc<dyn CleanupSource>
+        Arc::new(ContainerAdapter::new(
+            engine,
+            home.clone(),
+            keep_images.clone(),
+        )) as Arc<dyn CleanupSource>
     }));
 
     let scanner = Arc::new(ScanController::new(usage_sources, MIN_ROW_BYTES));

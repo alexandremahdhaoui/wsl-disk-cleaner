@@ -51,10 +51,22 @@ Space checks one item. `a` checks all and `n` clears all. Enter shows the exact 
 | Go | `go clean -cache -testcache` and `go clean -modcache` |
 | uv, pnpm, npm | `uv cache clean`, `pnpm store prune`, `npm cache clean --force` |
 | Podman, Docker | `container prune`, `volume prune` and `image prune -a` |
-| nerdctl | `nerdctl system prune --all --force --volumes` |
+| nerdctl | `container prune`, `volume prune`, `image prune -a` and `builder prune` |
 | Buildah | `buildah rm --all` |
 
 Tools you have not installed stay hidden.
+
+## A config keeps the container images you still need
+
+`image prune -a` deletes every image that has no container. A stopped container does not protect its image, because `wdc` prunes stopped containers first. List the images you need in `~/.config/wsl-disk-cleaner/config.json`:
+
+```json
+{
+  "keep_images": ["localhost/my-tool:latest"]
+}
+```
+
+During the image prune, `wdc` holds each listed image with a stopped container named `wdc-keep-<n>`, then removes that container. An image the engine does not have is skipped. A broken config or an unknown key stops `wdc` by name.
 
 ## A guard refuses to delete your work
 

@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -19,8 +19,13 @@ pub struct ContainerEngine {
     pub name: &'static str,
     pub what: &'static str,
     pub size: EngineSize,
-    pub commands: &'static [&'static [&'static str]],
+    pub before_images: &'static [&'static [&'static str]],
+    pub prune_images: &'static [&'static str],
+    pub after_images: &'static [&'static [&'static str]],
 }
+
+const KEEP_HOLDER_PREFIX: &str = "wdc-keep-";
+const HOLDER_COMMAND: &str = "true";
 
 pub const CONTAINER_ENGINES: &[ContainerEngine] = &[
     ContainerEngine {
@@ -28,30 +33,33 @@ pub const CONTAINER_ENGINES: &[ContainerEngine] = &[
         name: "Podman",
         what: "stopped containers, unused volumes and unused images",
         size: EngineSize::ReclaimableFromSystemDf,
-        commands: &[
-            &["container", "prune", "-f"],
-            &["volume", "prune", "-f"],
-            &["image", "prune", "-a", "-f"],
-        ],
+        before_images: &[&["container", "prune", "-f"], &["volume", "prune", "-f"]],
+        prune_images: &["image", "prune", "-a", "-f"],
+        after_images: &[],
     },
     ContainerEngine {
         bin: "docker",
         name: "Docker",
         what: "stopped containers, unused volumes, unused images and build cache",
         size: EngineSize::ReclaimableFromSystemDf,
-        commands: &[
+        before_images: &[
             &["container", "prune", "-f"],
             &["volume", "prune", "-a", "-f"],
-            &["image", "prune", "-a", "-f"],
-            &["builder", "prune", "-a", "-f"],
         ],
+        prune_images: &["image", "prune", "-a", "-f"],
+        after_images: &[&["builder", "prune", "-a", "-f"]],
     },
     ContainerEngine {
         bin: "nerdctl",
         name: "nerdctl",
         what: "stopped containers, unused volumes, unused images and build cache",
         size: EngineSize::RootlessDataDir(".local/share/containerd"),
-        commands: &[&["system", "prune", "--all", "--force", "--volumes"]],
+        before_images: &[
+            &["container", "prune", "-f"],
+            &["volume", "prune", "-a", "-f"],
+        ],
+        prune_images: &["image", "prune", "-a", "-f"],
+        after_images: &[&["builder", "prune", "-a", "-f"]],
     },
 ];
 
@@ -64,6 +72,7 @@ struct WireDfRow {
 pub struct ContainerAdapter {
     engine: &'static ContainerEngine,
     home: PathBuf,
+    keep_images: Vec<String>,
 }
 
 enum Probe {
@@ -72,8 +81,29 @@ enum Probe {
 }
 
 impl ContainerAdapter {
-    pub fn new(engine: &'static ContainerEngine, home: PathBuf) -> Self {
-        Self { engine, home }
+    pub fn new(engine: &'static ContainerEngine, home: PathBuf, keep_images: Vec<String>) -> Self {
+        Self {
+            engine,
+            home,
+            keep_images,
+        }
+    }
+
+    fn has_image(&self, image: &str) -> bool {
+        Command::new(self.engine.bin)
+            .args(["image", "inspect", image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn present_keep_images(&self) -> Vec<String> {
+        self.keep_images
+            .iter()
+            .filter(|image| self.has_image(image))
+            .cloned()
+            .collect()
     }
 
     fn run(&self, args: &[&str]) -> Result<Probe> {
@@ -125,7 +155,13 @@ impl ContainerAdapter {
         if bytes == Some(0) {
             return Ok(Discovery::Found(vec![]));
         }
-        Ok(Discovery::Found(vec![item_for(self.engine, path, bytes)]))
+        let kept = self.present_keep_images();
+        Ok(Discovery::Found(vec![item_for(
+            self.engine,
+            path,
+            bytes,
+            &kept,
+        )]))
     }
 }
 
@@ -159,23 +195,69 @@ fn total_reclaimable(output: &str) -> Result<u64> {
         .sum()
 }
 
-fn item_for(engine: &ContainerEngine, path: Option<PathBuf>, bytes: Option<u64>) -> CleanupItem {
+fn engine_command(engine: &ContainerEngine, args: &[&str]) -> Vec<String> {
+    std::iter::once(engine.bin)
+        .chain(args.iter().copied())
+        .map(String::from)
+        .collect()
+}
+
+fn holder_name(index: usize) -> String {
+    format!("{KEEP_HOLDER_PREFIX}{index}")
+}
+
+fn engine_commands(engine: &ContainerEngine, kept: &[String]) -> Vec<Vec<String>> {
+    let before = engine
+        .before_images
+        .iter()
+        .map(|args| engine_command(engine, args));
+    let create_holders = kept.iter().enumerate().map(|(index, image)| {
+        let name = holder_name(index);
+        engine_command(
+            engine,
+            &[
+                "create",
+                "--pull=never",
+                "--name",
+                &name,
+                image,
+                HOLDER_COMMAND,
+            ],
+        )
+    });
+    let prune = std::iter::once(engine_command(engine, engine.prune_images));
+    let remove_holders =
+        (0..kept.len()).map(|index| engine_command(engine, &["rm", "-v", &holder_name(index)]));
+    let after = engine
+        .after_images
+        .iter()
+        .map(|args| engine_command(engine, args));
+    before
+        .chain(create_holders)
+        .chain(prune)
+        .chain(remove_holders)
+        .chain(after)
+        .collect()
+}
+
+fn item_for(
+    engine: &ContainerEngine,
+    path: Option<PathBuf>,
+    bytes: Option<u64>,
+    kept: &[String],
+) -> CleanupItem {
+    let label = if kept.is_empty() {
+        engine.what.to_string()
+    } else {
+        format!("{}, keeping {}", engine.what, kept.join(", "))
+    };
     CleanupItem {
         source: engine.name.into(),
-        label: engine.what.into(),
+        label,
         path,
         required_markers: vec![],
         bytes,
-        commands: engine
-            .commands
-            .iter()
-            .map(|args| {
-                std::iter::once(engine.bin)
-                    .chain(args.iter().copied())
-                    .map(String::from)
-                    .collect()
-            })
-            .collect(),
+        commands: engine_commands(engine, kept),
     }
 }
 
@@ -195,7 +277,7 @@ mod tests {
 
     #[test]
     fn an_engine_item_prunes_containers_then_volumes_then_images() {
-        let item = item_for(&CONTAINER_ENGINES[0], None, Some(1));
+        let item = item_for(&CONTAINER_ENGINES[0], None, Some(1), &[]);
         let commands: Vec<_> = item.commands.iter().map(|c| c.join(" ")).collect();
         assert_eq!(
             commands,
@@ -206,6 +288,48 @@ mod tests {
             ]
         );
         assert_eq!(item.source, "Podman");
+    }
+
+    #[test]
+    fn a_kept_image_holds_a_container_only_while_images_are_pruned() {
+        let kept = vec!["localhost/lab:latest".to_string()];
+        let item = item_for(&CONTAINER_ENGINES[0], None, Some(1), &kept);
+        let commands: Vec<_> = item.commands.iter().map(|c| c.join(" ")).collect();
+        assert_eq!(
+            commands,
+            vec![
+                "podman container prune -f",
+                "podman volume prune -f",
+                "podman create --pull=never --name wdc-keep-0 localhost/lab:latest true",
+                "podman image prune -a -f",
+                "podman rm -v wdc-keep-0"
+            ]
+        );
+        assert!(item.label.ends_with("keeping localhost/lab:latest"));
+    }
+
+    #[test]
+    fn docker_cleans_its_build_cache_after_the_kept_images_are_released() {
+        let kept = vec!["lab".to_string()];
+        let commands = engine_commands(&CONTAINER_ENGINES[1], &kept);
+        assert_eq!(
+            commands.last().unwrap().join(" "),
+            "docker builder prune -a -f"
+        );
+        assert_eq!(
+            commands[commands.len() - 2].join(" "),
+            "docker rm -v wdc-keep-0"
+        );
+    }
+
+    #[test]
+    fn a_kept_image_that_the_engine_lacks_is_skipped() {
+        let adapter = ContainerAdapter::new(
+            &MISSING,
+            PathBuf::from("/"),
+            vec!["localhost/lab:latest".to_string()],
+        );
+        assert!(adapter.present_keep_images().is_empty());
     }
 
     #[test]
@@ -224,16 +348,19 @@ mod tests {
         assert_eq!(total_reclaimable(out).unwrap(), 1_000_000_000);
     }
 
+    static MISSING: ContainerEngine = ContainerEngine {
+        bin: "wdc-engine-that-does-not-exist",
+        name: "Missing",
+        what: "nothing",
+        size: EngineSize::ReclaimableFromSystemDf,
+        before_images: &[],
+        prune_images: &[],
+        after_images: &[],
+    };
+
     #[test]
     fn a_missing_engine_reports_not_installed() {
-        static MISSING: ContainerEngine = ContainerEngine {
-            bin: "wdc-engine-that-does-not-exist",
-            name: "Missing",
-            what: "nothing",
-            size: EngineSize::ReclaimableFromSystemDf,
-            commands: &[],
-        };
-        let adapter = ContainerAdapter::new(&MISSING, PathBuf::from("/"));
+        let adapter = ContainerAdapter::new(&MISSING, PathBuf::from("/"), vec![]);
         assert_eq!(adapter.discover().unwrap(), Discovery::NotInstalled);
     }
 }
